@@ -1,0 +1,68 @@
+# ePHPm configuration for a switchboard-api vhost.
+#
+# switchboard-api runs as one virtual host among others. ePHPm serves the vhost
+# directory *itself* as the document root — there is no `public/` convention —
+# so every file shipped beside `index.php` is a candidate for static serving.
+# The `[server.security]` block below is what closes that, and it is not
+# optional: without `blocked_paths` an unauthenticated caller can fetch
+# `/composer.json`, `/composer.lock` and the whole of `/vendor/`, which is a
+# precise inventory of dependency versions to check against known CVEs.
+#
+# `.switchboard/` needs no rule. ePHPm refuses any request path containing a
+# dot-prefixed segment and `[server.static] hidden_files` defaults to "deny",
+# so the state directory and the webhook secret are already unreachable.
+
+[server]
+listen = "0.0.0.0:8080"
+sites_dir = "/var/www/sites"
+
+# Optional: with `sites_domain_suffix = ".ephpm.dev"`, the directory
+# `/var/www/sites/switchboard/` serves `Host: switchboard.ephpm.dev`.
+# Without it, name the directory for the full host.
+sites_domain_suffix = ".ephpm.dev"
+
+# Fallback chain. This is ePHPm's default and is listed only to make the
+# routing explicit: anything that is not a real file reaches the front
+# controller, which sees the ORIGINAL client URI in REQUEST_URI.
+fallback = ["$uri", "$uri/", "/index.php?$query_string"]
+
+[server.security]
+# Everything that is not the front controller. `<prefix>/*` matches the
+# directory and every path beneath it.
+blocked_paths = [
+    "/vendor/*",
+    "/src/*",
+    "/tests/*",
+    "/tools/*",
+    "/examples/*",
+    "/composer.json",
+    "/composer.lock",
+    "/worker.php",
+    "/README.md",
+    "/MIGRATION.md",
+]
+
+# Only the front controller may execute PHP. `worker.php` is an entrypoint for
+# the worker runtime, never for an HTTP request, and this makes that structural
+# rather than conventional.
+allowed_php_paths = ["/index.php"]
+
+# `open_basedir` already defaults to true whenever `sites_dir` is set; stated
+# here because it is the property the whole architecture rests on. It confines
+# this vhost to its own directory plus a private state root, which is why an
+# internet-facing endpoint accepting unauthenticated POSTs cannot reach
+# `sites_dir` and cannot touch another tenant.
+open_basedir = true
+
+[server.static]
+# The default. `.switchboard/` depends on it.
+hidden_files = "deny"
+
+# ── Worker mode (opt-in) ─────────────────────────────────────────────────
+# fpm mode is the default and is what the webhook path is tuned for. To run
+# under ePHPm's persistent worker instead, install ephpm/psr15-worker and
+# uncomment:
+#
+# [php]
+# mode = "worker"
+# worker_script = "worker.php"

@@ -1,0 +1,10 @@
+# Composer dependencies — installed per deployment.
+/vendor/
+
+# Runtime state and secrets. `webhook_secret` lives here and must never be
+# committed; the queue and delivery markers are per-instance.
+/.switchboard/*
+!/.switchboard/.gitkeep
+
+# Staging debris from an interrupted atomic write.
+*.tmp

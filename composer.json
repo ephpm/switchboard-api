@@ -1,0 +1,38 @@
+{
+    "name": "ephpm/switchboard-api",
+    "description": "GitHub webhook receiver for ePHPm PR previews \u2014 a PSR-15 application that runs as a confined vhost inside ePHPm and hands jobs to the switchboard daemon.",
+    "type": "project",
+    "license": "proprietary",
+    "require": {
+        "php": ">=8.2",
+        "ext-hash": "*",
+        "ext-json": "*",
+        "laminas/laminas-diactoros": "^3.8",
+        "psr/http-factory": "^1.1",
+        "psr/http-message": "^2.0",
+        "psr/http-server-handler": "^1.0",
+        "psr/http-server-middleware": "^1.0"
+    },
+    "suggest": {
+        "ephpm/psr15-worker": "Run this app under ePHPm persistent worker mode. Opt-in \u2014 see the README; fpm mode is the default and is what the webhook path is tuned for."
+    },
+    "autoload": {
+        "psr-4": {
+            "Switchboard\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Switchboard\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "@php tools/test.php"
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
