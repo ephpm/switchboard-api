@@ -27,24 +27,110 @@ credential that can write to a GitHub repository.
 
 It is also dogfooding — the control plane runs on the product.
 
+## How a webhook becomes a preview (cluster mode)
+
+Single-node, a webhook writes straight to `.switchboard/queue/` and the local
+daemon picks it up — end of story, see [The job file contract](#the-job-file-contract).
+Behind a NodeBalancer fronting a cluster, a webhook still lands on exactly
+**one** node, but every node's daemon needs the job. This is how it reaches
+all of them: the node that received it publishes *desired state* to ePHPm's
+gossip-replicated KV instead of enqueuing locally, and every node's own
+`GET /drain` — kicked by its local daemon on a timer — reconciles that shared
+state back into its own `queue/`.
+
+```
+════════════ 1. WEBHOOK ARRIVES (any node) ════════════
+
+   GitHub PR event (opened / synchronize / closed)
+        │  POST /webhook  (HMAC-signed)
+        ▼
+   ┌──────────────────┐
+   │  NodeBalancer    │   forwards → lands on ANY one node
+   └────────┬─────────┘
+            ▼
+   ╔═══════════ node N ════════════════╗
+   ║  ePHPm                            ║
+   ║  ┌──────────────────────────────┐ ║   confined vhost: open_basedir,
+   ║  │ switchboard-api               │ ║   no shell, no GitHub App key,
+   ║  │  verify HMAC                  │ ║   write-only
+   ║  │  validate payload             │ ║
+   ║  │  ephpm_kv_set(                │ ║
+   ║  │    switchboard:preview:<label>)│─╫──▶ KV: desired state
+   ║  │  switchboard:index += <label> │ ║        │  gossip-replicated —
+   ║  │  ephpm_kv_incr(switchboard:gen)│ ║        │  see ePHPm's cluster docs
+   ║  └──────────────────────────────┘ ║        ▼
+   ╚════════════════════════════════════╝  every node's KV now has the job
+
+════════════ 2. EVERY NODE DRAINS, THE DAEMON BUILDS ════════════
+
+   ╔═══════════ each node ══════════════════════════════════════╗
+   ║  switchboard daemon (Rust, systemd unit, this repo's sibling) ║
+   ║   on a configurable interval:                                ║
+   ║     GET 127.0.0.1:8080/drain                                 ║
+   ║       Host: <switchboard-api vhost>                          ║
+   ║       X-Drain-Token: <.switchboard/drain_secret>              ║
+   ║          │                                                    ║
+   ║          ▼                                                    ║
+   ║   /drain (inside the confined vhost):                         ║
+   ║     REMOTE_ADDR == 127.0.0.1?          else 404                ║
+   ║     hash_equals(token, drain_secret)?  else 404                ║
+   ║     switchboard:gen changed since last_gen?   else fast 200    ║
+   ║     diff KV desired state vs .switchboard/applied/<label>       ║
+   ║     → write a job file into THIS node's .switchboard/queue/     ║
+   ║          │                                                      ║
+   ║          ▼                                                      ║
+   ║   daemon claims job (link()) → git fetch                        ║
+   ║     refs/pull/N/head → build → sites_dir/<label>                 ║
+   ╚═══════════════════════════════════════════════════════════════╝
+```
+
+A few properties worth calling out:
+
+- **Files, not the KV, still cross the API/daemon boundary on any one node.**
+  The KV only ever carries the *what* between nodes; `/drain` turns it back
+  into the exact same queue-file format the daemon already reads — see
+  [The job file contract](#the-job-file-contract) — so the daemon needs no
+  KV awareness at all.
+- **Desired state, not an event log.** A GitHub redelivery, a drain that
+  crashes partway, or a node rebooting all reconcile against the same
+  `switchboard:preview:<label>` key rather than replaying a queue of
+  individual webhook events, so nothing double-deploys because a drain
+  happened to run twice.
+- **The KV RESP listener stays off.** Every read and write above goes
+  through the in-process `ephpm_kv_*` SAPI functions, exactly like
+  `ephpm/cache` and the other in-process KV consumers — nothing here needs a
+  network client or credential to reach the KV.
+- **Single-node is the same code, minus the detour.** With no `ephpm_kv_*`
+  bridge present, the webhook writes to `queue/` directly, exactly as
+  before cluster mode existed, and `/drain` answers
+  `{"ok":true,"mode":"single-node","queued":0}` without touching the KV.
+
+See [Cluster mode](#cluster-mode) below for the exact key layout, the
+`/drain` response shapes, and how to provision `drain_secret`.
+
 ## HTTP surface
 
-Two endpoints. That is the whole thing.
+Two public endpoints, plus a third that only ever answers loopback traffic.
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| `POST` | `/webhook` | HMAC signature | receive a GitHub delivery, enqueue a job |
+| `POST` | `/webhook` | HMAC signature | receive a GitHub delivery, enqueue (or, in cluster mode, publish) a job |
 | `GET` | `/healthz` | none | liveness; reports whether a secret is configured |
+| `GET` | `/drain` | loopback + bearer token | cluster mode only: reconcile shared desired state into this node's local queue — see [Cluster mode](#cluster-mode) |
 
-There is **no dashboard and no read API**. GitHub is the interface: the daemon
-creates a Deployment when it picks up a job and posts `in_progress` →
+There is **no dashboard and no public read API**. GitHub is the interface: the
+daemon creates a Deployment when it picks up a job and posts `in_progress` →
 `success`/`failure` with the preview URL as `environment_url`, so the native
 "View deployment" box renders in the pull request itself. A developer looking at
 a preview is already on the PR page.
 
-A consequence worth stating plainly: **nothing flows back into this service.**
-It is write-only. There is no status directory for the daemon to write into and
-no endpoint that reads one, which is what keeps it safe to expose.
+A consequence worth stating plainly: **nothing flows back into this service
+from the outside.** It is write-only to the public internet. There is no
+status directory for the daemon to write into and no endpoint that reads one,
+which is what keeps it safe to expose. `/drain` does not change that: it
+never returns preview state to its caller (only counts), it only ever answers
+loopback, and everything it reads is state this same service published
+itself.
 
 ## Webhook handling
 
@@ -270,6 +356,118 @@ daemon receives values that have already been checked. A ref like
    and discarding older ones is safe and desirable; the API does not do it
    because superseding a job races with the daemon's claim.
 
+## Cluster mode
+
+See [How a webhook becomes a preview](#how-a-webhook-becomes-a-preview-cluster-mode)
+above for the end-to-end picture. This section is the reference: the exact KV
+keys, the `/drain` response shapes, and how to provision `drain_secret`.
+
+Cluster mode activates itself — there is no `SWITCHBOARD_*` flag for it. The
+webhook handler checks `function_exists('ephpm_kv_set')` once, at boot: if
+ePHPm's KV SAPI bridge is linked in, every subsequent webhook publishes
+desired state instead of writing straight to the local queue. On a
+single-node install (or any build without the KV bridge) it is exactly the
+behaviour this service always had.
+
+### KV key layout
+
+Three keys, all read and written through the in-process `ephpm_kv_*` SAPI
+functions — the KV RESP listener stays off; nothing here needs it, and this
+vhost is confined to its own per-site KV keyspace the same way it is confined
+to its own per-site database (ePHPm scopes both to the resolved vhost in
+multi-tenant `sites_dir` mode).
+
+| Key | Value | Written by | Read by |
+|---|---|---|---|
+| `switchboard:preview:<label>` | The full schema-1 job document (see [The job file contract](#the-job-file-contract)), verbatim, no TTL | `/webhook`, on every deploy or teardown | `/drain` |
+| `switchboard:index` | JSON array of every label with a `switchboard:preview:<label>` key | `/webhook` (adds), `/drain` (removes, teardown only) | `/drain` |
+| `switchboard:gen` | A counter (`ephpm_kv_incr`), bumped on every publish | `/webhook` | `/drain` (fast-path comparison) |
+
+There is no scan in the KV's SAPI surface (verified against
+`crates/ephpm-php/ephpm_wrapper.c`: get/set/setnx/del/exists/incr/decr/
+incr_by/expire/ttl/pttl/flush_all/wait — no `keys` or `scan`), which is why
+`switchboard:index` exists at all: it is a hand-rolled enumeration of every
+`switchboard:preview:*` key.
+
+**The index read-modify-write race is acknowledged, not closed.** Adding a
+label to `switchboard:index` means read the array, append, write it back —
+two webhooks for two different labels landing on two different nodes at the
+same instant can race, and one addition can be lost. This is bounded and
+self-healing rather than silent: `switchboard:preview:<label>` itself is a
+single `set()`, so the desired state a lost index update "hid" still exists,
+and the next webhook for that label (or an operator-triggered re-drain after
+the index is fixed) recovers it. Closing the race properly would need a lock
+this design does not otherwise require. See
+`Switchboard\Cluster\ClusterState`'s doc comment for the full reasoning.
+
+**Teardown stays in the index until a node has actually drained it.** The
+webhook path adds a label to the index on both deploy and teardown and never
+removes one — only `/drain`, after it has queued a teardown job locally,
+prunes the label from the index and deletes its `switchboard:preview:<label>`
+key. Removing it any earlier would risk a node that has not drained yet never
+finding out the preview should come down.
+
+### `GET /drain`
+
+Three independent gates, each answered identically — `404`, the same body
+`Router` returns for a genuinely unmatched path — so a probe of this endpoint
+learns nothing, the same property this README already claims for the removed
+dashboard and read API:
+
+1. **`REMOTE_ADDR` must be `127.0.0.1`.** A NodeBalancer fronting a cluster
+   forwards internet traffic to the same listener this vhost answers on, so
+   this vhost's ePHPm configuration must **never** put the NodeBalancer in
+   `trusted_proxies` — if it did, a client-supplied `X-Forwarded-For` could
+   spoof `REMOTE_ADDR` and defeat this check entirely.
+2. **`X-Drain-Token`** must match a line in `.switchboard/drain_secret`,
+   compared with `hash_equals`. Belt and braces against anything else sharing
+   the loopback interface on the same host.
+3. **Fail closed.** A missing or empty secret file, a missing header, or a
+   wrong token are all `404`.
+
+Response shapes, all `200` once the gates pass:
+
+| Situation | Body |
+|---|---|
+| No KV bridge (single-node) | `{"ok":true,"mode":"single-node","queued":0}` |
+| `switchboard:gen` unchanged since the last drain | `{"ok":true,"gen":<n>,"checked":0,"queued":0}` |
+| Reconciled | `{"ok":true,"gen":<n>,"checked":<labels examined>,"queued":<jobs written>}` |
+
+Materialization compares, per label in `switchboard:index`, the desired
+`<intent>@<sha>` (from `switchboard:preview:<label>`) against a local marker
+at `.switchboard/applied/<label>` — the last `<intent>@<sha>` **this node**
+has already queued. Unchanged: skipped, which is what makes a re-kick with
+nothing new a no-op. Changed: a job file is written using the exact same
+atomic-write / `<millis>-<16 hex>.json` code the webhook path uses, with a
+**freshly generated `job_id` and filename** — this is a per-node
+materialization of shared state, not a redelivery of the original webhook,
+so there is nothing to deduplicate against and no reason to preserve the
+original job id beyond the `delivery_id` field already inside the document.
+
+`/drain` makes no network calls, and the common case — nothing changed — is
+two KV reads (`switchboard:gen`, `.switchboard/last_gen`) before returning.
+
+### Provisioning `drain_secret`
+
+Same shape and rotation story as `webhook_secret` (see [Secrets](#secrets)):
+
+```bash
+umask 077
+openssl rand -hex 32 > /var/www/sites/switchboard/.switchboard/drain_secret
+chmod 600 /var/www/sites/switchboard/.switchboard/drain_secret
+```
+
+Configure the same value on the switchboard daemon's side, and set the
+daemon's drain-kick interval (an option the daemon owns, not this repo —
+see `ephpm/switchboard`'s own documentation). A short interval (a few
+seconds) keeps propagation fast without costing anything on a re-kick that
+finds nothing changed.
+
+`drain_secret` lives beside `webhook_secret` in `.switchboard/`, so it
+inherits the same protection: unreachable over HTTP because ePHPm refuses
+any request path with a dot-prefixed segment, and covered by this vhost's
+`open_basedir` and no other tenant's.
+
 ## Who talks to GitHub
 
 **The daemon does. The API never does.** It holds no GitHub App key and makes no
@@ -304,6 +502,11 @@ Build failures should additionally surface as a check run or a PR comment, since
 a `failure` deployment state alone does not carry the log.
 
 ## Secrets
+
+This section covers `webhook_secret`, the one every deployment needs. Cluster
+deployments also provision `drain_secret`, which follows the identical file
+format and rotation story — see [Provisioning drain_secret](#provisioning-drain_secret)
+under [Cluster mode](#cluster-mode) rather than duplicating it here.
 
 The webhook secret comes from one of two places, in this order:
 
@@ -401,7 +604,7 @@ blocked_paths = [
     "/composer.json", "/composer.lock", "/worker.php",
     "/README.md", "/MIGRATION.md",
 ]
-allowed_php_paths = ["/index.php", "/webhook", "/healthz"]
+allowed_php_paths = ["/index.php", "/webhook", "/healthz", "/drain"]
 open_basedir = true
 ```
 
@@ -409,8 +612,11 @@ open_basedir = true
 a front-controller application must list its routes rather than just
 `/index.php`. That is verified behaviour, not an assumption — listing only
 `/index.php` returns `403` for every request. It duplicates the route list in
-two places, which for a two-route application is a feature: ePHPm becomes a
-second, independent allowlist in front of the app's own routing.
+two places, which for a two-route (three-route in cluster mode) application is
+a feature: ePHPm becomes a second, independent allowlist in front of the app's
+own routing. Listing `/drain` unconditionally is harmless in single-node
+deployments — `DrainHandler`'s own localhost + token gate still applies
+underneath, see [Cluster mode](#cluster-mode).
 
 ```bash
 cd /var/www/sites/switchboard
@@ -497,7 +703,7 @@ php tools/test.php            # everything
 php tools/test.php Signature   # filter by class-name substring
 ```
 
-73 tests, 241 assertions, no test-framework dependency — see
+93 tests, 312 assertions, no test-framework dependency — see
 `tests/Support/TestCase.php` for why. Coverage is weighted toward the paths that
 matter:
 
@@ -515,7 +721,24 @@ matter:
 - **`PreviewLabelTest`** — cross-checked against the expected values in the Rust
   suite, including the multi-byte case where the byte-wise PHP port and the
   char-wise Rust must agree.
-- **`WebhookEndpointTest`** — the full pipeline end to end.
+- **`WebhookEndpointTest`** — the full pipeline end to end, single-node.
+- **`ClusterWebhookTest`** — cluster mode: a valid delivery publishes
+  `switchboard:preview:<label>`, adds to `switchboard:index`, and bumps
+  `switchboard:gen`, while writing **no** local queue file; rejected/duplicate
+  deliveries publish nothing; a teardown publishes but does not prune the
+  index; two labels accumulate independently in the index without duplicates.
+  Injects `Tests\Support\FakeKvClient` — an in-memory `KvClient` — directly
+  into `App::build()` rather than relying on `function_exists('ephpm_kv_set')`,
+  so cluster-mode and single-node tests can run in either order in the same
+  process without leaking into each other (see `Cluster\KvClient`'s doc
+  comment for why that matters).
+- **`DrainTest`** — the localhost/token/secret-file gates (all answering
+  `404`, including an empty or missing secret file); single-node mode as a
+  no-op; materializing exactly one job file per changed label; idempotency on
+  a re-kick, both via the `switchboard:gen` fast path and via the per-label
+  `applied/` marker when `gen` changed for an unrelated label; a teardown
+  being queued and then pruned from the index; a corrupted index entry being
+  skipped rather than used as a path component.
 
 ### Verified against a real ePHPm instance
 
@@ -533,25 +756,25 @@ binary** serving this app as a vhost, with `curl`. All 28 checks pass:
 - The removed dashboard and read API are gone, not dormant.
 
 The script hardcodes paths from the machine it was written on; adjust `EXE`,
-`BASE` and `SITE` before running it elsewhere.
+`BASE` and `SITE` before running it elsewhere. It predates cluster mode and
+does not yet exercise `/drain` against a real ePHPm binary — cluster-mode
+coverage today is the in-process `ClusterWebhookTest`/`DrainTest` suite only.
 
 ## Known gaps
 
-- **`composer.lock` is not committed.** Composer could not be executed in the
-  environment this was built in: its `PlatformRepository` scrapes
-  `phpinfo(INFO_MODULES)` for `SSL Version => …`, and the ePHPm-embedded PHP's
-  `phpinfo()` text output uses line endings the `^…$` multiline match does not
-  treat as boundaries, so Composer derives a platform package name containing
-  newlines and rejects its own input. (`curl_version()['ssl_version']` is clean,
-  so this is a `phpinfo()` formatting issue in the embedded SAPI — it breaks
-  Composer for *every* app run under `ephpm php` and is worth reporting
-  upstream.) The dependency tree was assembled from upstream tags instead and
-  verified to work; **generate and commit `composer.lock` on the first real
-  install.** Constraint satisfiability was checked by hand against published
-  package metadata, not by a solver.
 - Worker mode is **untested**. The app is PSR-15 and holds no request state, but
   it has not been run under `ephpm/psr15-worker`.
-- Multi-node is not considered. The queue is a local directory; the daemon must
-  run on the same host as the ePHPm instance serving this vhost.
+- **Cluster mode has not been verified against a real multi-node cluster.**
+  The KV desired-state publish and `/drain` reconciliation are covered by the
+  in-process `ClusterWebhookTest`/`DrainTest` suite (a fake `KvClient`
+  stands in for the gossip-replicated KV), and `App::boot()`'s
+  `SapiKvClient::available()` wiring has been smoke-tested against a real
+  `ephpm php` process, but no end-to-end run against an actual 3-node ePHPm
+  cluster behind a NodeBalancer has happened yet. `tools/live-verify.sh`
+  predates cluster mode entirely (see [Testing](#testing)).
 - Retention of delivery markers rides on request traffic (one request in fifty
-  prunes, bounded). A vhost that receives no traffic never prunes.
+  prunes, bounded). A vhost that receives no traffic never prunes. The same is
+  true of `.switchboard/applied/` markers in cluster mode: nothing currently
+  prunes a stale marker left behind by a label whose preview was torn down and
+  never redeployed (the marker is small and harmless, but it is not cleaned up
+  today).

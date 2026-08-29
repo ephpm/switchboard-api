@@ -7,6 +7,7 @@ namespace Switchboard\Webhook;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\ServerRequestInterface;
 use Psr\Http\Server\RequestHandlerInterface;
+use Switchboard\Cluster\ClusterState;
 use Switchboard\Config;
 use Switchboard\Http\Json;
 use Switchboard\Log;
@@ -56,6 +57,18 @@ use Switchboard\Storage\StorageException;
  * So this service holds exactly one credential: the webhook secret, which can
  * only be used to *verify*. The job carries `installation_id` so the daemon can
  * mint its own token.
+ *
+ * # Cluster mode
+ *
+ * A NodeBalancer-fronted cluster delivers a webhook to exactly one node, but
+ * every node needs the resulting job. When `$cluster` is non-null (see
+ * {@see \Switchboard\App::boot()} for how that is decided), this handler
+ * publishes the job as desired state to the gossip-replicated KV
+ * ({@see ClusterState::publish()}) **instead of** writing it to this node's
+ * local `queue/` — not in addition to. `GET /drain`
+ * ({@see \Switchboard\Cluster\DrainHandler}), kicked by every node's own
+ * daemon, is what turns that shared state back into each node's own queue
+ * files. See the README's cluster-mode section for the full picture.
  */
 final class WebhookHandler implements RequestHandlerInterface
 {
@@ -71,6 +84,7 @@ final class WebhookHandler implements RequestHandlerInterface
         private readonly SignatureVerifier $verifier,
         private readonly DeliveryLog $deliveries,
         private readonly JobQueue $queue,
+        private readonly ?ClusterState $cluster = null,
     ) {
     }
 
@@ -233,10 +247,21 @@ final class WebhookHandler implements RequestHandlerInterface
 
         $millis = (int) round(microtime(true) * 1000);
         $jobId = JobQueue::jobId($millis, $deliveryId);
+        $job = Job::build($pr, $jobId, $deliveryId, $intent, $millis);
+        $cluster = $this->cluster !== null;
+        $filename = null;
 
         try {
-            $filename = $this->queue->enqueue(Job::build($pr, $jobId, $deliveryId, $intent, $millis), $jobId);
-            $this->deliveries->markQueued($deliveryId, $filename);
+            if ($cluster) {
+                // Cluster mode: publish desired state instead of writing to
+                // this node's local queue — see the class doc. `/drain` on
+                // every node (including this one, on its own schedule) is
+                // what turns it into a queue file.
+                $this->cluster->publish($pr->label(), $job);
+            } else {
+                $filename = $this->queue->enqueue($job, $jobId);
+            }
+            $this->deliveries->markQueued($deliveryId, $filename ?? ('kv:' . $pr->label()));
         } catch (\Throwable $e) {
             // Release the claim so GitHub's redelivery gets another chance;
             // otherwise the marker would suppress the retry of a delivery that
@@ -255,6 +280,7 @@ final class WebhookHandler implements RequestHandlerInterface
             'action' => $pr->action,
             'intent' => $intent,
             'label' => $pr->label(),
+            'mode' => $cluster ? 'cluster' : 'local',
         ]);
 
         $this->maybePrune();
@@ -263,6 +289,7 @@ final class WebhookHandler implements RequestHandlerInterface
             'ok' => true,
             'job_id' => $jobId,
             'job_file' => $filename,
+            'mode' => $cluster ? 'cluster' : 'local',
             'intent' => $intent,
             'label' => $pr->label(),
         ]);

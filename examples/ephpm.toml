@@ -45,7 +45,14 @@ blocked_paths = [
 # Only the front controller may execute PHP. `worker.php` is an entrypoint for
 # the worker runtime, never for an HTTP request, and this makes that structural
 # rather than conventional.
-allowed_php_paths = ["/index.php"]
+#
+# `allowed_php_paths` matches the pre-rewrite URI, not the resolved script —
+# listing only "/index.php" here returns 403 for every request, including
+# "/webhook" and "/healthz", which is why every route this front controller
+# serves is listed explicitly. "/drain" only matters in cluster mode (see the
+# README); listing it unconditionally is harmless in single-node deployments,
+# since DrainHandler's own localhost + token gate still applies underneath.
+allowed_php_paths = ["/index.php", "/webhook", "/healthz", "/drain"]
 
 # `open_basedir` already defaults to true whenever `sites_dir` is set; stated
 # here because it is the property the whole architecture rests on. It confines

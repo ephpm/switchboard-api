@@ -7,6 +7,10 @@ namespace Switchboard;
 use Laminas\Diactoros\ResponseFactory;
 use Psr\Http\Message\ResponseFactoryInterface;
 use Psr\Http\Server\RequestHandlerInterface;
+use Switchboard\Cluster\ClusterState;
+use Switchboard\Cluster\DrainHandler;
+use Switchboard\Cluster\KvClient;
+use Switchboard\Cluster\SapiKvClient;
 use Switchboard\Http\ErrorBoundary;
 use Switchboard\Http\Json;
 use Switchboard\Http\Pipeline;
@@ -38,34 +42,56 @@ use Switchboard\Webhook\WebhookHandler;
  * it safe to build once and reuse across a worker's lifetime — and it is the
  * discipline the code should follow regardless, which is why it is followed
  * even though fpm mode is the default.
+ *
+ * # Cluster mode
+ *
+ * `boot()` is the one place that decides single-node vs. cluster:
+ * `SapiKvClient::available()` checks `function_exists('ephpm_kv_set')` and,
+ * if the KV SAPI bridge is present, passes a real `SapiKvClient` into
+ * `build()`. `build()` itself takes `?KvClient $kv` as an explicit,
+ * optional argument — `null` means single-node — rather than making that
+ * check itself, so tests can force either mode deterministically by passing
+ * (or not passing) a fake, regardless of what `function_exists()` would
+ * report in the test process. See `Cluster\KvClient`'s doc comment for why
+ * that indirection matters.
  */
 final class App
 {
     /** Build the handler from the environment, rooted at the application directory. */
     public static function boot(string $appRoot): RequestHandlerInterface
     {
-        return self::build(Config::load($appRoot));
+        $kv = SapiKvClient::available() ? new SapiKvClient() : null;
+
+        return self::build(Config::load($appRoot), kv: $kv);
     }
 
-    public static function build(Config $config, ?ResponseFactoryInterface $responses = null): RequestHandlerInterface
-    {
+    public static function build(
+        Config $config,
+        ?ResponseFactoryInterface $responses = null,
+        ?KvClient $kv = null,
+    ): RequestHandlerInterface {
         $paths = new Paths($config->stateDir);
         $paths->ensure();
 
         $json = new Json($responses ?? new ResponseFactory());
         $writer = new AtomicWriter($paths->tmp());
+        $queue = new JobQueue($paths->queue(), $writer);
+        $cluster = $kv !== null ? new ClusterState($kv) : null;
 
         $webhook = new WebhookHandler(
             $config,
             $json,
             new SignatureVerifier($config->webhookSecrets),
             new DeliveryLog($paths->deliveries(), $writer),
-            new JobQueue($paths->queue(), $writer),
+            $queue,
+            $cluster,
         );
+
+        $drain = new DrainHandler($paths, $json, $writer, $queue, $cluster);
 
         return new Pipeline(
             [new ErrorBoundary($json)],
-            new Router($config, $json, $webhook),
+            new Router($config, $json, $webhook, $drain),
         );
     }
 }

@@ -4,24 +4,11 @@
  * Generates a stand-in `vendor/autoload.php`.
  *
  * **Not part of a normal deployment.** Real installs run `composer install`,
- * which writes its own `vendor/autoload.php`; this script exists only so the
- * suite can run on a machine where Composer cannot execute.
- *
- * The reason it cannot, on the ePHPm-embedded PHP used to develop this:
- * Composer's `PlatformRepository` scrapes `phpinfo(INFO_MODULES)` for
- * `SSL Version => …` inside the curl section, and this build's `phpinfo()` text
- * output uses line endings that the `^…$` multiline match does not treat as
- * line boundaries. The `.+` therefore runs past the end of the line and
- * Composer derives a platform package name containing newlines, which its own
- * validator then rejects:
- *
- *     Invalid package found during dependency resolution, aborting:
- *     lib-curl-schannel\nzlib version => 1.3.2\nlibssh version => libssh2
- *
- * `curl_version()['ssl_version']` itself is clean ("Schannel"), so this is a
- * `phpinfo()` formatting issue in the embedded SAPI, not a curl one. It is
- * worth reporting upstream — it breaks Composer for every application running
- * under `ephpm php`.
+ * which writes its own `vendor/autoload.php` — Composer runs fine under
+ * `ephpm php` as of ePHPm's `ephpm php` CLI work (verified: `composer install`
+ * completes, including `phpinfo()`-based platform detection). This script
+ * predates that fix and is kept only as a dependency-free fallback for a
+ * machine that has no `composer.phar` handy at all.
  *
  * Usage: ephpm php tools/vendor-autoload.php
  */

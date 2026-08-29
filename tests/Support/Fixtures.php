@@ -10,6 +10,7 @@ use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\ServerRequestInterface;
 use Psr\Http\Server\RequestHandlerInterface;
 use Switchboard\App;
+use Switchboard\Cluster\KvClient;
 use Switchboard\Config;
 
 /** Shared helpers: temp state directories, signed PSR-7 requests, sample payloads. */
@@ -44,10 +45,16 @@ final class Fixtures
         ]);
     }
 
-    /** @param array<string, mixed> $overrides */
-    public static function app(string $stateDir, array $overrides = []): RequestHandlerInterface
+    /**
+     * @param array<string, mixed> $overrides
+     * @param KvClient|null        $kv Pass a {@see FakeKvClient} to build the app
+     *                                 in cluster mode; `null` (the default) is
+     *                                 single-node, matching production when the
+     *                                 KV SAPI bridge is absent.
+     */
+    public static function app(string $stateDir, array $overrides = [], ?KvClient $kv = null): RequestHandlerInterface
     {
-        return App::build(self::config($stateDir, $overrides));
+        return App::build(self::config($stateDir, $overrides), kv: $kv);
     }
 
     /** The `X-Hub-Signature-256` value GitHub would send for `$body`. */
@@ -60,21 +67,40 @@ final class Fixtures
      * A PSR-7 request with a literal body.
      *
      * @param array<string, string> $headers
+     * @param array<string, mixed>  $serverParams e.g. `['REMOTE_ADDR' => '127.0.0.1']`
      */
-    public static function request(string $method, string $path, string $body = '', array $headers = []): ServerRequestInterface
-    {
+    public static function request(
+        string $method,
+        string $path,
+        string $body = '',
+        array $headers = [],
+        array $serverParams = [],
+    ): ServerRequestInterface {
         $stream = new Stream('php://temp', 'wb+');
         $stream->write($body);
         $stream->rewind();
 
         return new ServerRequest(
-            serverParams: [],
+            serverParams: $serverParams,
             uploadedFiles: [],
             uri: $path,
             method: $method,
             body: $stream,
             headers: $headers,
         );
+    }
+
+    /**
+     * A `GET /drain` request as the local daemon would send it: from
+     * loopback, carrying the token header.
+     */
+    public static function drainRequest(
+        ?string $token = self::SECRET,
+        string $remoteAddr = '127.0.0.1',
+    ): ServerRequestInterface {
+        $headers = $token === null ? [] : ['X-Drain-Token' => $token];
+
+        return self::request('GET', '/drain', '', $headers, ['REMOTE_ADDR' => $remoteAddr]);
     }
 
     /**
@@ -111,6 +137,16 @@ final class Fixtures
         }
 
         return self::request('POST', '/webhook', $body, $headers);
+    }
+
+    /**
+     * Write `.switchboard/drain_secret` directly, bypassing the app — the state
+     * directory must already exist (i.e. `Fixtures::app()` must have run first,
+     * since `App::build()` is what calls `Paths::ensure()`).
+     */
+    public static function writeDrainSecret(string $stateDir, string $secret = self::SECRET): void
+    {
+        file_put_contents($stateDir . '/drain_secret', $secret . "\n");
     }
 
     /** @return array<string, mixed> */

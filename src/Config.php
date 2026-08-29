@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Switchboard;
 
+use Switchboard\Storage\SecretFile;
+
 /**
  * Runtime configuration.
  *
@@ -125,20 +127,9 @@ final class Config
      */
     private static function secrets(string $file, string $envName): array
     {
-        if (is_file($file) && is_readable($file)) {
-            $contents = @file_get_contents($file);
-            if ($contents !== false) {
-                $lines = [];
-                foreach (preg_split('/\R/', $contents) ?: [] as $line) {
-                    $line = trim($line);
-                    if ($line !== '' && !str_starts_with($line, '#')) {
-                        $lines[] = $line;
-                    }
-                }
-                if ($lines !== []) {
-                    return $lines;
-                }
-            }
+        $lines = SecretFile::read($file);
+        if ($lines !== []) {
+            return $lines;
         }
 
         $fromEnv = self::env($envName);

@@ -12,11 +12,12 @@ use Switchboard\Config;
 /**
  * Routing, in one `match`.
  *
- * The HTTP surface is two endpoints: the webhook and a health check. A router
- * package — Slim, League\Route, FastRoute — would add between one and seven
- * transitive dependencies to dispatch that, and every one of them is code
- * reachable from an unauthenticated POST. There is no pattern to compile and no
- * path parameters to extract.
+ * The HTTP surface is three endpoints: the webhook, a health check, and (in
+ * cluster mode) the localhost-only drain. A router package — Slim,
+ * League\Route, FastRoute — would add between one and seven transitive
+ * dependencies to dispatch that, and every one of them is code reachable
+ * from an unauthenticated POST. There is no pattern to compile and no path
+ * parameters to extract.
  *
  * Path resolution note: ePHPm's default fallback chain sends anything that is
  * not a real file to `index.php`, while keeping `REQUEST_URI` as the *original*
@@ -29,6 +30,7 @@ final class Router implements RequestHandlerInterface
         private readonly Config $config,
         private readonly Json $json,
         private readonly RequestHandlerInterface $webhook,
+        private readonly RequestHandlerInterface $drain,
     ) {
     }
 
@@ -42,6 +44,7 @@ final class Router implements RequestHandlerInterface
         return match ($path) {
             '/webhook' => $this->webhook->handle($request),
             '/healthz' => $this->health(),
+            '/drain' => $this->drain->handle($request),
             default => $this->json->response(404, ['ok' => false, 'error' => 'not found']),
         };
     }
