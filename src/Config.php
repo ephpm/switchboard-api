@@ -37,9 +37,10 @@ use Switchboard\Storage\SecretFile;
  * `DB_PASSWORD`, `EPHPM_REDIS_*` — arrive through the SAPI's
  * `register_server_variables` hook and land in **`$_SERVER` only**. Neither
  * `getenv()` nor `$_ENV` sees them. Nothing here needs those particular
- * variables today (this service uses no database and no KV store), but any
- * configuration added later must read `$_SERVER` or it will silently find
- * nothing.
+ * variables today (this service uses no database; its cluster-mode KV use
+ * goes through the `ephpm_kv_*` SAPI functions, which need no injected
+ * credentials), but any configuration added later must read `$_SERVER` or it
+ * will silently find nothing.
  */
 final class Config
 {

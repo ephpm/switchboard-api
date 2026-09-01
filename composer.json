@@ -2,7 +2,7 @@
     "name": "ephpm/switchboard-api",
     "description": "GitHub webhook receiver for ePHPm PR previews \u2014 a PSR-15 application that runs as a confined vhost inside ePHPm and hands jobs to the switchboard daemon.",
     "type": "project",
-    "license": "proprietary",
+    "license": "MIT",
     "require": {
         "php": ">=8.2",
         "ext-hash": "*",
