@@ -10,7 +10,7 @@ It is deliberately small and deliberately unable to do very much.
 ## Why this exists
 
 `ephpm/switchboard` was one Rust binary that received webhooks *and* provisioned
-previews. It is being split in two:
+previews. It was split in two:
 
 | Component | Language | Runs as | Responsibility |
 |---|---|---|---|
@@ -543,9 +543,11 @@ committed.
 Credentials ePHPm injects per request (`DB_*`, `EPHPM_REDIS_*`) arrive through
 the SAPI's `register_server_variables` hook and land in **`$_SERVER` only** —
 neither `getenv()` nor `$_ENV` sees them. `Config::env()` therefore reads
-`$_SERVER` first and falls back to `getenv()`. This service uses no database and
-no KV store, so nothing depends on it today, but any configuration added later
-must follow the same order or it will silently find nothing.
+`$_SERVER` first and falls back to `getenv()`. This service uses no database,
+and in cluster mode it *does* use the embedded KV store — via the `ephpm_kv_*`
+SAPI functions (`SapiKvClient`), which need no injected credentials — so today
+nothing depends on the `$_SERVER` injection path, but any configuration added
+later must follow the same order or it will silently find nothing.
 
 ## Configuration
 
