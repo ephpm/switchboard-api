@@ -58,6 +58,25 @@ use Switchboard\Storage\StorageException;
  */
 final class ClusterState
 {
+    /**
+     * How long retired desired state stays readable after the first node has
+     * materialized it — see {@see expirePreview()}.
+     *
+     * This is the window in which a node that has not drained yet can still
+     * discover a teardown. It has to comfortably exceed the longest gap
+     * between one node's drains: the interval itself is two seconds, but a
+     * node is also not draining while it reboots, while its ePHPm is being
+     * upgraded, or while it is briefly unreachable. A day covers all of those
+     * with room to spare, and bounds how long a retired label keeps costing a
+     * KV read on every drain.
+     *
+     * A node down *longer* than this returns having permanently missed the
+     * teardown. That residual is stated rather than hidden, and it is the case
+     * {@see DrainHandler}'s "generation advanced but nothing to do" warning
+     * exists to surface.
+     */
+    public const RETIRED_PREVIEW_TTL_SECONDS = 24 * 60 * 60;
+
     private const PREVIEW_PREFIX = 'switchboard:preview:';
     private const INDEX_KEY = 'switchboard:index';
     private const GEN_KEY = 'switchboard:gen';
@@ -70,11 +89,12 @@ final class ClusterState
      * Publish desired state for `$label` and bump the generation counter.
      *
      * Called for both `intent: deploy` and `intent: teardown` — the intent
-     * lives inside `$job` and travels through unchanged. The label is added
-     * to the index either way; a teardown is deliberately NOT removed from
-     * the index here; {@see DrainHandler} prunes it only once a node has
-     * actually queued the teardown locally, so every node gets a chance to
-     * see it.
+     * lives inside `$job` and travels through unchanged. The label is added to
+     * the index either way, and nothing on this path ever removes it. Retiring
+     * desired state is {@see expirePreview()}'s job, on a clock; pruning the
+     * index is {@see removeFromIndex()}'s, and only once that clock has run
+     * out. Neither may happen merely because one node is finished with the
+     * label — see {@see expirePreview()} for what that cost.
      *
      * @param array<string, mixed> $job The full schema-1 job document, verbatim.
      *
@@ -112,10 +132,34 @@ final class ClusterState
         return is_array($decoded) ? $decoded : null;
     }
 
-    /** Best-effort cleanup, called once a node has queued a teardown locally. */
-    public function deletePreview(string $label): void
+    /**
+     * Retire desired state for `$label` **without** making it immediately
+     * unreadable by the nodes that have not seen it yet.
+     *
+     * This replaces an outright `del()`, and the difference is the whole of
+     * switchboard#24. Desired state is published once and has to be consumed
+     * independently by every node in the cluster. Deleting the key as soon as
+     * *one* node had queued the teardown made the shared state a race with
+     * exactly one winner: nodes whose two-second drain tick had not yet fired
+     * found the label gone, queued nothing, and — because the `gen` cursor
+     * advances regardless — recorded themselves as current at a generation
+     * whose work they had never done. The observed result was a torn-down
+     * preview still being served by a subset of the cluster, with every health
+     * check green, plus its tenant database left on disk indefinitely.
+     *
+     * Giving the key a TTL instead keeps it discoverable for
+     * {@see RETIRED_PREVIEW_TTL_SECONDS} while still bounding its lifetime.
+     * Re-materializing is free: {@see DrainHandler} compares the published
+     * `<intent>@<sha>` against this node's own `applied/<label>` marker, so a
+     * node that has already queued the teardown skips it every time.
+     *
+     * Best-effort by design — a failed expiry leaves the key readable, which
+     * is the safe direction. The label leaves {@see index()} only once the key
+     * has actually gone (see {@see removeFromIndex()}).
+     */
+    public function expirePreview(string $label): void
     {
-        $this->kv->del(self::PREVIEW_PREFIX . $label);
+        $this->kv->expire(self::PREVIEW_PREFIX . $label, self::RETIRED_PREVIEW_TTL_SECONDS);
     }
 
     /** @return list<string> */
@@ -134,7 +178,17 @@ final class ClusterState
         return array_values(array_filter($decoded, 'is_string'));
     }
 
-    /** Called from the drain side, only after a teardown has been queued locally. */
+    /**
+     * Drop `$label` from the shared index.
+     *
+     * Called from the drain side, and **only** once
+     * `switchboard:preview:<label>` has actually expired — never merely
+     * because this node has finished with the label. The index is the only way
+     * a node enumerates desired state, so removing an entry is removing it from
+     * every node at once; doing that on one node's say-so is precisely the bug
+     * {@see expirePreview()} describes. By the time the key is gone the TTL has
+     * given every node a day to notice it.
+     */
     public function removeFromIndex(string $label): void
     {
         $index = array_values(array_filter(
