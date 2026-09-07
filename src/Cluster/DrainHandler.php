@@ -57,10 +57,35 @@ use Switchboard\Webhook\PreviewLabel;
  * `job_id`/filename — this is a per-node materialization of shared state,
  * not a redelivery of the original webhook, so there is nothing to
  * deduplicate against. Same: skip it, which is what makes a re-kick with no
- * changes a no-op. A queued teardown is additionally pruned from the shared
- * index and its preview key deleted — best-effort, and only after the local
- * queue write succeeds, so a crash between the two just costs a redundant
- * (but harmless, marker-suppressed) prune attempt on the next drain.
+ * changes a no-op.
+ *
+ * # Retiring a teardown is not the same as finishing one (switchboard#24)
+ *
+ * A queued teardown starts a TTL on its preview key
+ * ({@see ClusterState::expirePreview()}); it does **not** delete the key or
+ * prune the index. That distinction is the whole point. Desired state is
+ * published once and has to be consumed independently by all N nodes, so any
+ * step that makes it unreadable the moment *one* node is done turns the shared
+ * state into a race with a single winner. It did: the first node to drain a
+ * teardown deleted the key and pruned the index, and every node whose
+ * two-second tick had not yet fired then walked an index the label had already
+ * left, queued nothing, and advanced `last_gen` anyway — recording itself
+ * current at a generation whose work it had never done. The preview stayed
+ * served on those nodes, and its tenant database stayed on disk.
+ *
+ * The index therefore shrinks in exactly one place: when a label's preview key
+ * is found already gone, i.e. the TTL has expired and every node has had a day
+ * to act. Re-materialization in the meantime is free — the `applied/<label>`
+ * marker suppresses it — which is why the daemon must **keep** a
+ * `teardown@<sha>` marker rather than reaping it (switchboard's `teardown.rs`).
+ * Those two halves are one contract; the daemon's half ships first.
+ *
+ * # A cursor that moves without work is reported
+ *
+ * {@see handle()} warns when the generation advanced but this drain queued
+ * nothing. That is the fingerprint of desired state withdrawn before this node
+ * saw it, and it is what made the original incident invisible: nothing logged,
+ * so the only evidence was a hand-diff of `applied/` across three nodes.
  *
  * No network calls anywhere in this path. The common case — nothing changed
  * since `.switchboard/last_gen` — is two KV reads.
@@ -93,11 +118,33 @@ final class DrainHandler implements RequestHandlerInterface
         }
 
         $gen = $this->cluster->generation();
-        if ($gen === $this->readLastGen()) {
+        $lastGen = $this->readLastGen();
+        if ($gen === $lastGen) {
             return $this->json->response(200, ['ok' => true, 'gen' => $gen, 'checked' => 0, 'queued' => 0]);
         }
 
         [$checked, $queued] = $this->materialize($this->cluster);
+
+        // The cursor is about to move past generations this node did no work
+        // for. That is *usually* benign — but it is also the exact signature of
+        // desired state that was published and then withdrawn before this node
+        // drained, which is how a torn-down preview survives on one node of the
+        // cluster with every health check green (switchboard#24). It used to be
+        // completely silent; the incident it caused was found by diffing
+        // `applied/` markers across three nodes by hand. One line here would
+        // have named it in minutes, so it is a WARN even though it can fire
+        // benignly — a rare false positive is worth a failure mode that
+        // otherwise leaves no trace anywhere.
+        if ($queued === 0) {
+            Log::warn('drain: cursor advancing past generations this node did no work for', [
+                'from_gen' => $lastGen,
+                'to_gen' => $gen,
+                'skipped' => $gen - $lastGen,
+                'checked' => $checked,
+                'hint' => 'desired state may have been withdrawn before this node drained',
+            ]);
+        }
+
         $this->writeLastGen($gen);
 
         return $this->json->response(200, ['ok' => true, 'gen' => $gen, 'checked' => $checked, 'queued' => $queued]);
@@ -154,8 +201,19 @@ final class DrainHandler implements RequestHandlerInterface
 
             $desired = $cluster->preview($label);
             if ($desired === null) {
-                // Index says it exists, preview key does not (raced with a
-                // delete, or never written). Nothing to materialize.
+                // The index lists a label whose preview key is gone. Post
+                // switchboard#24 that means one thing in the normal course of
+                // events: a retired teardown whose TTL has run out, so every
+                // node has had a full day to materialize it and the index entry
+                // is now the only thing left. Prune it — this is the *only*
+                // place the index shrinks, and it is safe precisely because the
+                // shared state it points at is already unreachable for
+                // everyone, rather than about to become unreachable for
+                // everyone but us.
+                Log::info('drain: pruning an index entry whose desired state has expired', [
+                    'label' => $label,
+                ]);
+                $cluster->removeFromIndex($label);
                 continue;
             }
 
@@ -202,8 +260,14 @@ final class DrainHandler implements RequestHandlerInterface
             $queued++;
 
             if ($intent === 'teardown') {
-                $cluster->removeFromIndex($label);
-                $cluster->deletePreview($label);
+                // Start the retirement clock rather than deleting the key.
+                // This node is done with the label; the other nodes are not
+                // necessarily, and there is no way from here to know. Deleting
+                // here — which is what this did — made the first node to drain
+                // silently withdraw the teardown from every node that had not
+                // ticked yet. See ClusterState::expirePreview(). The index
+                // entry stays until the key has actually expired.
+                $cluster->expirePreview($label);
             }
         }
 

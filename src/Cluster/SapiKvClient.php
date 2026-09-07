@@ -15,9 +15,15 @@ namespace Switchboard\Cluster;
  *
  *   - `ephpm_kv_set(string $key, string $value, int $ttl_secs = 0): bool` —
  *     the third parameter is a plain `int` default, not `?int`; `0` means no
- *     expiry. This class never passes one: desired state has no TTL.
+ *     expiry. This class never passes one: desired state is retired by
+ *     {@see expire()} at the moment it becomes retirable, not on a clock
+ *     started when it was published.
  *   - `ephpm_kv_get(string $key): ?string`
  *   - `ephpm_kv_del(string $key): int` (count removed — this class discards it)
+ *   - `ephpm_kv_expire(string $key, int $ttl_secs): bool` — **two required
+ *     args**, and the TTL is in whole **seconds**: the wrapper multiplies by
+ *     1000 itself (`ttl_ms = ttl * 1000`) before calling into Rust. Passing
+ *     milliseconds here would set an expiry a thousand times too long.
  *   - `ephpm_kv_incr(string $key): int|false` (false only when no KV store is
  *     registered at all, which {@see available()} already rules out)
  *
@@ -36,6 +42,7 @@ final class SapiKvClient implements KvClient
         return function_exists('ephpm_kv_get')
             && function_exists('ephpm_kv_set')
             && function_exists('ephpm_kv_del')
+            && function_exists('ephpm_kv_expire')
             && function_exists('ephpm_kv_incr');
     }
 
@@ -54,6 +61,13 @@ final class SapiKvClient implements KvClient
     public function del(string $key): void
     {
         \ephpm_kv_del($key);
+    }
+
+    public function expire(string $key, int $ttlSeconds): void
+    {
+        // Seconds, not milliseconds — see the class doc. The bool return says
+        // only whether the key existed; a key already gone needs no expiry.
+        \ephpm_kv_expire($key, $ttlSeconds);
     }
 
     public function incr(string $key): ?int

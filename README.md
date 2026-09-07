@@ -379,8 +379,8 @@ multi-tenant `sites_dir` mode).
 
 | Key | Value | Written by | Read by |
 |---|---|---|---|
-| `switchboard:preview:<label>` | The full schema-1 job document (see [The job file contract](#the-job-file-contract)), verbatim, no TTL | `/webhook`, on every deploy or teardown | `/drain` |
-| `switchboard:index` | JSON array of every label with a `switchboard:preview:<label>` key | `/webhook` (adds), `/drain` (removes, teardown only) | `/drain` |
+| `switchboard:preview:<label>` | The full schema-1 job document (see [The job file contract](#the-job-file-contract)), verbatim. No TTL while live; a 24h TTL once a node has queued its teardown | `/webhook`, on every deploy or teardown | `/drain` |
+| `switchboard:index` | JSON array of every label with a `switchboard:preview:<label>` key | `/webhook` (adds), `/drain` (removes, only once the preview key has expired) | `/drain` |
 | `switchboard:gen` | A counter (`ephpm_kv_incr`), bumped on every publish | `/webhook` | `/drain` (fast-path comparison) |
 
 There is no scan in the KV's SAPI surface (verified against
@@ -400,12 +400,39 @@ the index is fixed) recovers it. Closing the race properly would need a lock
 this design does not otherwise require. See
 `Switchboard\Cluster\ClusterState`'s doc comment for the full reasoning.
 
-**Teardown stays in the index until a node has actually drained it.** The
+**Retiring a teardown is not the same as finishing one.** Desired state is
+published once and must be consumed independently by *every* node, so nothing
+may make it unreadable at the moment a single node is done with it. The
 webhook path adds a label to the index on both deploy and teardown and never
-removes one — only `/drain`, after it has queued a teardown job locally,
-prunes the label from the index and deletes its `switchboard:preview:<label>`
-key. Removing it any earlier would risk a node that has not drained yet never
-finding out the preview should come down.
+removes one. `/drain`, once it has queued a teardown locally, sets a **24-hour
+TTL** on `switchboard:preview:<label>` — it does not delete the key, and it
+does not touch the index. The index shrinks in exactly one place: when a drain
+finds a label whose preview key has already expired, i.e. every node has had a
+day to act.
+
+This is the fix for [switchboard#24](https://github.com/ephpm/switchboard/issues/24).
+Deleting the key and pruning the index as soon as one node had queued the
+teardown turned the shared state into a race with a single winner. Nodes whose
+two-second drain tick had not yet fired walked an index the label had already
+left, queued nothing, and advanced `last_gen` anyway — recording themselves
+current at a generation whose work they had never done. In production that
+left a torn-down preview still being served by part of the cluster (round-robin
+DNS, so roughly a third of requests) with every health check green, and its
+per-tenant database on disk indefinitely.
+
+Re-materializing in the meantime costs nothing: the `applied/<label>` marker
+suppresses it. That makes the marker load-bearing, and is why the daemon
+**keeps** a `teardown@<sha>` marker instead of reaping it. The two halves are
+one contract — **the daemon's change ships first**; see the daemon's
+`teardown.rs`.
+
+**A cursor that moves without work is logged.** `/drain` emits a `warn` when
+`switchboard:gen` advanced but the drain queued nothing, naming the generation
+range it is stepping over. That is the fingerprint of desired state withdrawn
+before this node saw it. It can fire benignly (a republish of a label this
+node already has at the same sha), and it is a `warn` anyway: the original
+incident produced no log line at all, and was found only by hand-diffing
+`applied/` markers across three nodes.
 
 ### `GET /drain`
 
@@ -739,8 +766,13 @@ matter:
   no-op; materializing exactly one job file per changed label; idempotency on
   a re-kick, both via the `switchboard:gen` fast path and via the per-label
   `applied/` marker when `gen` changed for an unrelated label; a teardown
-  being queued and then pruned from the index; a corrupted index entry being
-  skipped rather than used as a path component.
+  being queued and retired on a TTL rather than deleted; a corrupted index
+  entry being skipped rather than used as a path component. Also the
+  switchboard#24 regression: a **three-node** fixture — one shared
+  `FakeKvClient`, three independent state dirs, which is the real topology —
+  where one node receives the webhook and all three must queue the teardown.
+  Against the old code it fails with `node b must queue the teardown`,
+  reproducing the production symptom exactly.
 
 ### Verified against a real ePHPm instance
 
@@ -776,7 +808,16 @@ coverage today is the in-process `ClusterWebhookTest`/`DrainTest` suite only.
   predates cluster mode entirely (see [Testing](#testing)).
 - Retention of delivery markers rides on request traffic (one request in fifty
   prunes, bounded). A vhost that receives no traffic never prunes. The same is
-  true of `.switchboard/applied/` markers in cluster mode: nothing currently
-  prunes a stale marker left behind by a label whose preview was torn down and
-  never redeployed (the marker is small and harmless, but it is not cleaned up
-  today).
+  true of `.switchboard/applied/` markers in cluster mode: nothing prunes a
+  marker left behind by a label whose preview was torn down and never
+  redeployed. As of switchboard#24 that is deliberate rather than an oversight
+  — the `teardown@<sha>` marker is this node's receipt, and it is what stops
+  `/drain` re-queueing the teardown while the desired state is still published.
+  One ~50-byte file per label ever previewed, superseded in place if the PR is
+  reopened. Bounded by PR count, not by time, so it is still not *cleaned up*.
+- **A node down longer than the 24-hour retired-preview TTL permanently misses
+  any teardown retired while it was away.** The TTL bounds how long shared
+  desired state stays discoverable; a node absent for longer comes back with no
+  way to learn the preview should have come down. The "cursor advanced but
+  nothing queued" warning is what surfaces it — there is no automatic
+  reconciliation of a node's `sites_dir` against the cluster's live site list.

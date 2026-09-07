@@ -47,6 +47,15 @@ interface KvClient
 
     public function del(string $key): void;
 
+    /**
+     * Set a time-to-live on an existing `$key`, in **seconds**.
+     *
+     * Used instead of {@see del()} to retire desired state that every node
+     * must still get a chance to see — see {@see ClusterState::expirePreview()}.
+     * A no-op when the key does not exist.
+     */
+    public function expire(string $key, int $ttlSeconds): void;
+
     /** Atomically increment `$key` (creating it at 0 first if absent). `null` on failure. */
     public function incr(string $key): ?int;
 }

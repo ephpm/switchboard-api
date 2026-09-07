@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Switchboard\Tests;
 
+use Switchboard\Cluster\ClusterState;
 use Switchboard\Tests\Support\FakeKvClient;
 use Switchboard\Tests\Support\Fixtures;
 use Switchboard\Tests\Support\TestCase;
@@ -192,7 +193,7 @@ final class DrainTest extends TestCase
         $this->assertSame(2, count($this->jobs($dir)));
     }
 
-    public function testTeardownIsQueuedThenPrunedFromTheIndex(): void
+    public function testTeardownIsQueuedAndRetiredOnATtlNotDeletedOutright(): void
     {
         $dir = Fixtures::tempDir();
         $kv = new FakeKvClient();
@@ -213,10 +214,99 @@ final class DrainTest extends TestCase
         $job = json_decode((string) file_get_contents($this->jobs($dir)[0]), true);
         $this->assertSame('teardown', $job['intent']);
 
-        // Pruned from the shared index and the preview key deleted, now that
-        // a node has actually queued the teardown locally.
-        $this->assertSame([], json_decode((string) $kv->raw('switchboard:index'), true));
+        // switchboard#24: this node is done, the other nodes are not. The
+        // desired state stays readable — on a clock — and the index still
+        // lists it, so a sibling that has not drained yet can still find it.
+        $this->assertNotNull(
+            $kv->raw('switchboard:preview:' . $label),
+            'deleting the key here withdraws the teardown from every node that has not drained yet',
+        );
+        $this->assertTrue($kv->hasExpiry('switchboard:preview:' . $label));
+        $this->assertSame([$label], json_decode((string) $kv->raw('switchboard:index'), true));
+    }
+
+    /**
+     * The whole incident, reproduced: three nodes, one publish, and a node
+     * whose drain tick lands after a sibling's. Before switchboard#24 the
+     * late node found the label already gone from the index, queued nothing,
+     * and advanced its cursor anyway — leaving the preview served and its
+     * tenant database on disk on that node alone.
+     */
+    public function testATeardownReachesEveryNodeNotJustTheFirstToDrain(): void
+    {
+        // One shared KV — the gossip-replicated store — and three independent
+        // state dirs, which is exactly the real topology.
+        $kv = new FakeKvClient();
+        $nodes = [];
+        foreach (['a', 'b', 'c'] as $name) {
+            $dir = Fixtures::tempDir();
+            Fixtures::writeDrainSecret($dir);
+            $nodes[$name] = ['dir' => $dir, 'app' => Fixtures::app($dir, [], $kv)];
+        }
+
+        // The webhook lands on exactly one node — round-robin DNS picks it.
+        $nodes['a']['app']->handle(
+            Fixtures::webhookRequest(Fixtures::pullRequestBody(['action' => 'closed'])),
+        );
+
+        // Every node drains, in whatever order. All three must queue it.
+        foreach ($nodes as $name => $node) {
+            $body = Fixtures::decode($node['app']->handle(Fixtures::drainRequest()));
+            $this->assertSame(1, $body['queued'], "node {$name} must queue the teardown");
+
+            $jobs = $this->jobs($node['dir']);
+            $this->assertSame(1, count($jobs), "node {$name} must have exactly one job");
+            $job = json_decode((string) file_get_contents($jobs[0]), true);
+            $this->assertSame('teardown', $job['intent'], "node {$name} queued the wrong intent");
+        }
+    }
+
+    /** A node that already queued the teardown must not queue it again while the key lives. */
+    public function testReDrainingARetiredTeardownIsANoOp(): void
+    {
+        $dir = Fixtures::tempDir();
+        $kv = new FakeKvClient();
+        $app = Fixtures::app($dir, [], $kv);
+        Fixtures::writeDrainSecret($dir);
+
+        $app->handle(Fixtures::webhookRequest(Fixtures::pullRequestBody(['action' => 'closed'])));
+        $app->handle(Fixtures::drainRequest());
+        $this->assertSame(1, count($this->jobs($dir)));
+
+        // Force a full walk rather than the last_gen fast path, so this proves
+        // the applied/ marker is doing the suppressing, not the cursor.
+        $kv->incr('switchboard:gen');
+        $body = Fixtures::decode($app->handle(Fixtures::drainRequest()));
+
+        $this->assertSame(0, $body['queued']);
+        $this->assertSame(1, count($this->jobs($dir)), 'the marker must suppress a re-queue');
+    }
+
+    /** Once the TTL has run out, the index entry is the only thing left — prune it. */
+    public function testAnExpiredPreviewKeyIsPrunedFromTheIndex(): void
+    {
+        $dir = Fixtures::tempDir();
+        $kv = new FakeKvClient();
+        $app = Fixtures::app($dir, [], $kv);
+        Fixtures::writeDrainSecret($dir);
+
+        $app->handle(Fixtures::webhookRequest(Fixtures::pullRequestBody(['action' => 'closed'])));
+        $app->handle(Fixtures::drainRequest());
+
+        $label = 'ephpm-wordpress-sample-pr-42';
+        $this->assertSame([$label], json_decode((string) $kv->raw('switchboard:index'), true));
+
+        $kv->advance(ClusterState::RETIRED_PREVIEW_TTL_SECONDS + 1);
         $this->assertNull($kv->raw('switchboard:preview:' . $label));
+
+        $kv->incr('switchboard:gen');
+        $app->handle(Fixtures::drainRequest());
+
+        $this->assertSame(
+            [],
+            json_decode((string) $kv->raw('switchboard:index'), true),
+            'the index shrinks only after the desired state is unreachable for everyone',
+        );
     }
 
     /** A deploy and a later teardown of the same label are two distinct markers, so both queue. */
