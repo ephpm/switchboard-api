@@ -151,12 +151,15 @@ final class DrainTest extends TestCase
         // this is a per-node materialization, not a redelivery.
         $this->assertMatches('/^\d{13}-[0-9a-f]{16}$/', $job['job_id']);
 
-        // Re-kick with nothing new: `gen` is unchanged, so the fast path
-        // returns before the index is even read.
+        // Re-kick with nothing new: since issue #4 the drain always reconciles
+        // on content rather than trusting `gen == last_gen`, so it DOES re-walk
+        // the index (checked = 1) — but the per-label `applied/` marker makes
+        // the unchanged label a no-op, so it queues nothing and writes no second
+        // job. Idempotency now comes from the marker, not from skipping the walk.
         $second = $app->handle(Fixtures::drainRequest());
         $secondBody = Fixtures::decode($second);
 
-        $this->assertSame(0, $secondBody['checked']);
+        $this->assertSame(1, $secondBody['checked'], 'content is reconciled every kick, not gated on the gen cursor');
         $this->assertSame(0, $secondBody['queued']);
         $this->assertSame(1, count($this->jobs($dir)), 'a re-kick with nothing new must not queue a second job');
     }
@@ -259,6 +262,63 @@ final class DrainTest extends TestCase
             $job = json_decode((string) file_get_contents($jobs[0]), true);
             $this->assertSame('teardown', $job['intent'], "node {$name} queued the wrong intent");
         }
+    }
+
+    /**
+     * Issue #4: a node reaps a teardown even when its generation cursor already
+     * equals the published generation.
+     *
+     * `switchboard:gen` is one best-effort, gossip-replicated counter, and
+     * ClusterState::publish()'s incr is explicitly best-effort — gossip can drop
+     * or lag that single increment while the preview-key `set` still replicates.
+     * When it does, a node that already advanced `last_gen` to the current `gen`
+     * (here: after materializing the deploy) sees `gen == last_gen` even though
+     * the preview CONTENT has since flipped deploy→teardown. On the live v0.10.1
+     * cluster that left the torn-down preview served on the two nodes that never
+     * received the close webhook.
+     *
+     * The old code short-circuited on `gen == last_gen` and never reaped. This
+     * models the divergence directly — flip the preview to teardown WITHOUT
+     * bumping `gen` — and asserts the node still queues the teardown. It fails on
+     * the pre-#4 code (queued = 0).
+     */
+    public function testTeardownIsReapedEvenWhenTheGenerationCursorAlreadyMatches(): void
+    {
+        $dir = Fixtures::tempDir();
+        $kv = new FakeKvClient();
+        $app = Fixtures::app($dir, [], $kv);
+        Fixtures::writeDrainSecret($dir);
+
+        // The node deploys the preview and advances its cursor to the current gen.
+        $app->handle(Fixtures::webhookRequest(Fixtures::pullRequestBody()));
+        $app->handle(Fixtures::drainRequest());
+        $this->assertSame(1, count($this->jobs($dir)));
+
+        $label = 'ephpm-wordpress-sample-pr-42';
+        $genAfterDeploy = $kv->raw('switchboard:gen');
+        $applied = @file_get_contents($dir . '/applied/' . $label);
+        $this->assertTrue(str_starts_with((string) $applied, 'deploy@'), 'precondition: this node has the deploy applied');
+
+        // The close webhook's teardown desired state replicates (the `set`), but
+        // its generation increment is lost/lagged in gossip — so `gen` stays
+        // exactly where this node's cursor already sits. Model that by flipping
+        // the preview content to teardown WITHOUT bumping the counter.
+        $teardown = json_decode((string) $kv->raw('switchboard:preview:' . $label), true);
+        $teardown['intent'] = 'teardown';
+        $kv->set('switchboard:preview:' . $label, json_encode($teardown, JSON_UNESCAPED_SLASHES));
+        $this->assertSame($genAfterDeploy, $kv->raw('switchboard:gen'), 'precondition: gen did NOT move with the flip');
+
+        // Old code: gen == last_gen, so the drain returns without walking and
+        // never reaps. Fixed code reconciles on content and queues the teardown.
+        $body = Fixtures::decode($app->handle(Fixtures::drainRequest()));
+        $this->assertSame(1, $body['queued'], 'the node must reap a teardown even when its gen cursor already matches');
+
+        $intents = array_map(
+            static fn (string $p): mixed => json_decode((string) file_get_contents($p), true)['intent'],
+            $this->jobs($dir),
+        );
+        sort($intents);
+        $this->assertSame(['deploy', 'teardown'], $intents, 'both the deploy and the later teardown were materialized');
     }
 
     /** A node that already queued the teardown must not queue it again while the key lives. */

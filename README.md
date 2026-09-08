@@ -74,7 +74,7 @@ state back into its own `queue/`.
    ║   /drain (inside the confined vhost):                         ║
    ║     REMOTE_ADDR == 127.0.0.1?          else 404                ║
    ║     hash_equals(token, drain_secret)?  else 404                ║
-   ║     switchboard:gen changed since last_gen?   else fast 200    ║
+   ║     walk switchboard:index EVERY kick (content, not the gen cursor) ║
    ║     diff KV desired state vs .switchboard/applied/<label>       ║
    ║     → write a job file into THIS node's .switchboard/queue/     ║
    ║          │                                                      ║
@@ -426,13 +426,20 @@ suppresses it. That makes the marker load-bearing, and is why the daemon
 one contract — **the daemon's change ships first**; see the daemon's
 `teardown.rs`.
 
-**A cursor that moves without work is logged.** `/drain` emits a `warn` when
-`switchboard:gen` advanced but the drain queued nothing, naming the generation
-range it is stepping over. That is the fingerprint of desired state withdrawn
-before this node saw it. It can fire benignly (a republish of a label this
-node already has at the same sha), and it is a `warn` anyway: the original
-incident produced no log line at all, and was found only by hand-diffing
-`applied/` markers across three nodes.
+**Reconcile on content, not on the generation cursor.** `switchboard:gen` is a
+single best-effort, gossip-replicated counter, so a lost or lagged increment can
+leave a preview key's content changed — a deploy flipped to a teardown — while
+`gen` still equals a node's last-seen value. `/drain` therefore walks the index
+and compares desired state against the `applied/<label>` markers on **every**
+kick; it never lets `gen == last_gen` short-circuit that. An earlier version did,
+and a node whose cursor already matched never learned about a teardown it hadn't
+received a webhook for, so it kept serving a torn-down preview with every health
+check green (the generation-vs-content race one layer under switchboard#24). The
+cursor is kept only for observability: when a walk queues work `gen` did not
+announce, `/drain` logs it as the signature of a lagged increment. Resetting
+`last_gen` to force a re-walk is explicitly **not** the fix — that resurrects
+stale deploy intents; the `applied/` markers are what keep the always-on walk
+idempotent.
 
 ### `GET /drain`
 
@@ -457,8 +464,12 @@ Response shapes, all `200` once the gates pass:
 | Situation | Body |
 |---|---|
 | No KV bridge (single-node) | `{"ok":true,"mode":"single-node","queued":0}` |
-| `switchboard:gen` unchanged since the last drain | `{"ok":true,"gen":<n>,"checked":0,"queued":0}` |
-| Reconciled | `{"ok":true,"gen":<n>,"checked":<labels examined>,"queued":<jobs written>}` |
+| Reconciled (every cluster-mode kick) | `{"ok":true,"gen":<n>,"checked":<labels examined>,"queued":<jobs written>}` |
+
+`checked` is the number of labels in `switchboard:index` examined this kick and
+`queued` the number whose desired state differed from this node's `applied/`
+marker; a kick with nothing to do returns `queued: 0` with `checked` equal to
+the index size.
 
 Materialization compares, per label in `switchboard:index`, the desired
 `<intent>@<sha>` (from `switchboard:preview:<label>`) against a local marker
@@ -471,8 +482,12 @@ materialization of shared state, not a redelivery of the original webhook,
 so there is nothing to deduplicate against and no reason to preserve the
 original job id beyond the `delivery_id` field already inside the document.
 
-`/drain` makes no network calls, and the common case — nothing changed — is
-two KV reads (`switchboard:gen`, `.switchboard/last_gen`) before returning.
+`/drain` makes no network calls. A kick with nothing changed is one index read
+plus, per indexed label, a preview-key read and a local `applied/` marker
+comparison — cheap, and paid every kick precisely so a lagged `switchboard:gen`
+can never hide a teardown (issue #4). `gen`/`.switchboard/last_gen` are still
+read and recorded, but only for the observability log line, never to skip the
+walk.
 
 ### Provisioning `drain_secret`
 
@@ -764,15 +779,17 @@ matter:
 - **`DrainTest`** — the localhost/token/secret-file gates (all answering
   `404`, including an empty or missing secret file); single-node mode as a
   no-op; materializing exactly one job file per changed label; idempotency on
-  a re-kick, both via the `switchboard:gen` fast path and via the per-label
-  `applied/` marker when `gen` changed for an unrelated label; a teardown
-  being queued and retired on a TTL rather than deleted; a corrupted index
-  entry being skipped rather than used as a path component. Also the
-  switchboard#24 regression: a **three-node** fixture — one shared
-  `FakeKvClient`, three independent state dirs, which is the real topology —
-  where one node receives the webhook and all three must queue the teardown.
-  Against the old code it fails with `node b must queue the teardown`,
-  reproducing the production symptom exactly.
+  a re-kick, driven by the per-label `applied/` marker (the drain reconciles
+  content on every kick rather than short-circuiting on `switchboard:gen`);
+  a teardown being queued and retired on a TTL rather than deleted; a
+  corrupted index entry being skipped rather than used as a path component.
+  Also two regressions. The switchboard#24 three-node fixture — one shared
+  `FakeKvClient`, three independent state dirs, the real topology — where one
+  node receives the webhook and all three must queue the teardown. And the
+  issue #4 generation-vs-content divergence: a node whose `last_gen` already
+  equals the published `gen` (a gossip-lagged increment) still reaps a
+  teardown whose content replicated, where the old cursor short-circuit
+  queued nothing.
 
 ### Verified against a real ePHPm instance
 
