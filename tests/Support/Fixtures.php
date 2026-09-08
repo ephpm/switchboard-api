@@ -38,10 +38,17 @@ final class Fixtures
     {
         // `+` keeps the LEFT operand's keys, so overrides must come first or a
         // caller could never change a value that has a default here.
+        //
+        // `allowedRepos` defaults to `ephpm/*` because the sample payloads all
+        // belong to `ephpm/*` and, since issue #3, an *unconfigured* allowlist
+        // fails closed — a node with no allowlist rejects every delivery. This
+        // default therefore models a correctly-configured node; the fail-closed
+        // path is exercised by explicitly overriding `allowedRepos` to `null`.
         return Config::fromArray($overrides + [
             'appRoot' => $stateDir,
             'stateDir' => $stateDir,
             'webhookSecrets' => [self::SECRET],
+            'allowedRepos' => ['ephpm/*'],
         ]);
     }
 

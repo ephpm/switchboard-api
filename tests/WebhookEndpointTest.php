@@ -538,6 +538,51 @@ final class WebhookEndpointTest extends TestCase
         $this->assertSame(1, count($this->jobs($dir)));
     }
 
+    /**
+     * Issue #3: an *unconfigured* allowlist must fail closed — a validly signed
+     * delivery (which, with a public App, any installer can produce) is refused
+     * with a loud 4xx and queues nothing. Before the fix an unset allowlist
+     * defaulted open and this same delivery deployed.
+     */
+    public function testUnconfiguredAllowlistRejectsEveryDeliveryClosed(): void
+    {
+        $dir = Fixtures::tempDir();
+        $app = Fixtures::app($dir, ['allowedRepos' => null]);
+
+        $response = $app->handle(Fixtures::webhookRequest(Fixtures::pullRequestBody()));
+
+        $this->assertSame(403, $response->getStatusCode(), 'an unconfigured allowlist must reject, not accept');
+        $this->assertStringContains('allowlist', Fixtures::decode($response)['error']);
+        $this->assertSame([], $this->jobs($dir), 'a fail-closed rejection must queue nothing');
+    }
+
+    /**
+     * The escape hatch is explicit and loud, never reached by omission: with the
+     * allow-any opt-in set, the same otherwise-unallowlisted delivery is
+     * accepted (and, in the code, a warning is logged on every such delivery).
+     */
+    public function testExplicitAllowAnyRepoAcceptsEveryDelivery(): void
+    {
+        $dir = Fixtures::tempDir();
+        $app = Fixtures::app($dir, ['allowedRepos' => null, 'allowAnyRepo' => true]);
+
+        $response = $app->handle(Fixtures::webhookRequest(Fixtures::pullRequestBody([
+            'repository' => [
+                'full_name' => 'literally/anyone',
+                'name' => 'anyone',
+                'owner' => ['login' => 'literally'],
+                'clone_url' => 'https://github.com/literally/anyone.git',
+            ],
+            'pull_request' => ['head' => ['repo' => [
+                'full_name' => 'literally/anyone',
+                'clone_url' => 'https://github.com/literally/anyone.git',
+            ]]],
+        ])));
+
+        $this->assertSame(202, $response->getStatusCode());
+        $this->assertSame(1, count($this->jobs($dir)), 'allow-any must accept a repo that is on no list');
+    }
+
     // ── other routes ────────────────────────────────────────────────────
 
     public function testHealthzIsUnauthenticated(): void
@@ -556,6 +601,21 @@ final class WebhookEndpointTest extends TestCase
 
         $this->assertSame(200, $response->getStatusCode());
         $this->assertFalse(Fixtures::decode($response)['webhook_configured']);
+    }
+
+    /** Issue #3: the fail-closed misconfiguration is visible on `/healthz`, not silent. */
+    public function testHealthzReportsWhetherTheAllowlistIsConfigured(): void
+    {
+        $dir = Fixtures::tempDir();
+
+        $configured = Fixtures::app($dir)->handle(Fixtures::request('GET', '/healthz'));
+        $this->assertTrue(Fixtures::decode($configured)['allowlist_configured']);
+
+        $unconfigured = Fixtures::app($dir, ['allowedRepos' => null])->handle(Fixtures::request('GET', '/healthz'));
+        $this->assertFalse(
+            Fixtures::decode($unconfigured)['allowlist_configured'],
+            'an unconfigured (fail-closed) allowlist must show as not configured',
+        );
     }
 
     public function testUnknownRouteIs404(): void

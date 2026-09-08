@@ -21,6 +21,10 @@ namespace Switchboard\Storage;
  *     .switchboard/
  *       webhook_secret     ← operator-provided (never committed)
  *       drain_secret       ← operator-provided, gates GET /drain (never committed)
+ *       allowed_repos      ← operator-provided allowlist, one owner/repo or
+ *                             owner/* per line; absent ⇒ fail closed (issue #3)
+ *       allow_any_repo     ← operator-provided sentinel: accept EVERY repo
+ *                             (explicit opt-out of the allowlist)
  *       tmp/               ← staging for atomic writes; same filesystem as the rest
  *       queue/             ← API writes jobs here, daemon consumes   (API → daemon)
  *       queue/claimed/     ← daemon moves jobs here while working
