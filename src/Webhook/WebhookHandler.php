@@ -190,7 +190,38 @@ final class WebhookHandler implements RequestHandlerInterface
         }
 
         // ── policy ──────────────────────────────────────────────────────
-        if (!$this->config->repoAllowed($pr->repoFullName)) {
+        // Fail closed on an unconfigured allowlist. A public GitHub App has one
+        // webhook URL and one secret, so every installer's deliveries are
+        // validly signed; without an allowlist that means any GitHub user who
+        // installs the App could deploy arbitrary build/seed commands onto this
+        // node (issue #3). This is distinct from a signed delivery for a repo
+        // simply not on the list (below): that is an operational non-event, so
+        // it stays a 202. An *unconfigured* allowlist is an operator error, so
+        // it is a loud 4xx with the missing config named in the log — the same
+        // shape as the missing-webhook-secret handling above.
+        if (!$this->config->allowlistConfigured()) {
+            Log::error('webhook rejected: repository allowlist not configured', [
+                'delivery' => $deliveryId,
+                'repo' => $pr->repoFullName,
+                'hint' => 'write .switchboard/allowed_repos (one owner/repo or owner/* per line) or set '
+                    . 'SWITCHBOARD_ALLOWED_REPOS; to accept every repository set the explicit opt-in '
+                    . '.switchboard/allow_any_repo or SWITCHBOARD_ALLOW_ANY_REPO=1',
+            ]);
+
+            return $this->json->response(403, ['ok' => false, 'error' => 'repository allowlist not configured']);
+        }
+
+        if ($this->config->allowAnyRepo) {
+            // The explicit, deliberately loud opt-out of the allowlist. Every
+            // installer of this App can deploy; say so on every accepted
+            // delivery so it cannot pass unnoticed in a public deployment.
+            Log::warn('webhook: repository allowlist bypassed by explicit opt-in', [
+                'delivery' => $deliveryId,
+                'repo' => $pr->repoFullName,
+                'hint' => 'SWITCHBOARD_ALLOW_ANY_REPO / .switchboard/allow_any_repo is set — '
+                    . 'every installer of this GitHub App can deploy to this node',
+            ]);
+        } elseif (!$this->config->repoAllowed($pr->repoFullName)) {
             Log::warn('webhook repository not allowed', ['delivery' => $deliveryId, 'repo' => $pr->repoFullName]);
 
             return $this->json->response(202, ['ok' => true, 'ignored' => 'repository', 'repo' => $pr->repoFullName]);

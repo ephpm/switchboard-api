@@ -52,10 +52,15 @@ final class Router implements RequestHandlerInterface
     /**
      * Liveness, unauthenticated.
      *
-     * Reports whether a webhook secret is loaded as a boolean, so an operator
-     * can confirm a deployment is configured without the check itself
-     * disclosing anything usable. There is nothing else to expose: the daemon
-     * reports preview state to GitHub, so this service holds no view of it.
+     * Reports whether a webhook secret is loaded and whether a repository
+     * allowlist is in force, both as booleans, so an operator can confirm a
+     * deployment is configured without the check itself disclosing anything
+     * usable (no secret material, no repository names). `allowlist_configured`
+     * is `false` when neither an allowlist nor the explicit allow-any opt-in is
+     * set — the fail-closed state in which `/webhook` rejects every delivery
+     * (issue #3), made visible here rather than left silent. There is nothing
+     * else to expose: the daemon reports preview state to GitHub, so this
+     * service holds no view of it.
      */
     private function health(): ResponseInterface
     {
@@ -63,6 +68,7 @@ final class Router implements RequestHandlerInterface
             'ok' => true,
             'service' => 'switchboard-api',
             'webhook_configured' => $this->config->webhookSecrets !== [],
+            'allowlist_configured' => $this->config->allowlistConfigured(),
         ]);
     }
 }

@@ -115,7 +115,7 @@ Two public endpoints, plus a third that only ever answers loopback traffic.
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | `POST` | `/webhook` | HMAC signature | receive a GitHub delivery, enqueue (or, in cluster mode, publish) a job |
-| `GET` | `/healthz` | none | liveness; reports whether a secret is configured |
+| `GET` | `/healthz` | none | liveness; reports whether a secret and a repository allowlist are configured |
 | `GET` | `/drain` | loopback + bearer token | cluster mode only: reconcile shared desired state into this node's local queue — see [Cluster mode](#cluster-mode) |
 
 There is **no dashboard and no public read API**. GitHub is the interface: the
@@ -585,9 +585,41 @@ All optional except the secret.
 | `SWITCHBOARD_WEBHOOK_SECRET` | — | Fallback if the secret file is absent. |
 | `SWITCHBOARD_STATE_DIR` | `<app>/.switchboard` | Where the queue and markers live. |
 | `SWITCHBOARD_ALLOW_FORKS` | `false` | Queue deploys for pull requests from forks. |
-| `SWITCHBOARD_ALLOWED_REPOS` | unset (all) | Comma-separated `owner/repo` or `owner/*`. |
+| `SWITCHBOARD_ALLOWED_REPOS` | unset | Comma-separated `owner/repo` or `owner/*`. **Secondary** to `.switchboard/allowed_repos`; unset **fails closed** — see below. |
+| `SWITCHBOARD_ALLOW_ANY_REPO` | `false` | Explicit, loud opt-out of the allowlist — accept **every** repository. |
 | `SWITCHBOARD_GITHUB_HOST` | `github.com` | Host clone URLs must belong to. Set for GHES. |
 | `SWITCHBOARD_MAX_BODY_BYTES` | `26214400` | Request body ceiling. |
+
+### The repository allowlist fails closed
+
+The allowlist decides which repositories may enqueue a deploy. It is read, in
+this order, exactly like the webhook secret:
+
+1. **`.switchboard/allowed_repos`** — one `owner/repo` or `owner/*` pattern per
+   line, `#` comments and blank lines ignored. **The recommended source**, and
+   on ePHPm the *only* one that reliably reaches the app: ePHPm injects nothing
+   into a vhost's environment, so a value set only in `SWITCHBOARD_ALLOWED_REPOS`
+   silently never applies. This is the exact bug issue #3 records — an allowlist
+   that read from the environment alone was a no-op on the live cluster.
+2. `SWITCHBOARD_ALLOWED_REPOS` — a secondary, container-friendly source.
+
+**Unset means reject everything, not accept everything.** A public GitHub App
+has a single webhook URL and one secret, so *every* installer's deliveries are
+validly signed; an allowlist that defaulted open let any GitHub user who
+installed the App deploy arbitrary `build:`/`seed:` commands onto the node. So
+with no allowlist configured, `/webhook` answers `403` and logs the missing
+config, and `/healthz` reports `"allowlist_configured": false`.
+
+If you genuinely want to accept every repository, say so **explicitly and
+loudly**: create `.switchboard/allow_any_repo` (any non-comment content) or set
+`SWITCHBOARD_ALLOW_ANY_REPO=1`. Either logs a warning on every accepted
+delivery. There is no way to reach unrestricted operation by omission.
+
+```bash
+# The ephpm preview cluster restricts previews to the org's own repos:
+printf 'ephpm/*\n' > /var/www/sites/switchboard/.switchboard/allowed_repos
+chmod 600 /var/www/sites/switchboard/.switchboard/allowed_repos
+```
 
 ### Forks are refused by default
 

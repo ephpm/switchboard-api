@@ -30,6 +30,29 @@ use Switchboard\Storage\SecretFile;
  * possible without a window of rejected deliveries. Blank lines and `#`
  * comments are ignored.
  *
+ * # The repository allowlist comes from a file too (issue #3)
+ *
+ * The allowlist follows the **exact same file-first pattern** as the webhook
+ * secret, and for the same reason: on ePHPm the process environment is shared
+ * across vhosts, and — more to the point — ePHPm injects *nothing* into this
+ * vhost's environment, so a value that lives only in `SWITCHBOARD_ALLOWED_REPOS`
+ * never reaches this code and the allowlist silently never applies. Reading
+ * `.switchboard/allowed_repos` (one `owner/repo` or `owner/*` pattern per line,
+ * `#` comments and blank lines ignored) is what makes it actually take effect on
+ * a live node.
+ *
+ * **It fails closed.** When neither the file nor `SWITCHBOARD_ALLOWED_REPOS`
+ * provides an allowlist, {@see repoAllowed()} denies *every* repository. A
+ * public GitHub App has a single webhook URL and one secret, so every
+ * installer's deliveries are validly signed; an unconfigured allowlist that
+ * defaulted open (the pre-#3 behaviour) let any GitHub user who installed the
+ * App deploy arbitrary `build:`/`seed:` commands onto the node. Unrestricted
+ * operation is still possible, but only as a loud, explicit opt-in — a
+ * `.switchboard/allow_any_repo` sentinel file (any non-comment content) or
+ * `SWITCHBOARD_ALLOW_ANY_REPO=1` — never something reached by omission. This is
+ * the ePHPm "an operator's intended restriction must not silently become a
+ * no-op" rule (ephpm#429/#463/#473).
+ *
  * # Reading the environment
  *
  * {@see env()} checks `$_SERVER` before `getenv()`, and that order is
@@ -49,7 +72,8 @@ final class Config
 
     /**
      * @param list<string>      $webhookSecrets Accepted webhook secrets (rotation-friendly).
-     * @param list<string>|null $allowedRepos   `owner/repo` or `owner/*` patterns; null = no restriction.
+     * @param list<string>|null $allowedRepos   `owner/repo` or `owner/*` patterns; null = unconfigured (fails closed).
+     * @param bool              $allowAnyRepo   Explicit opt-in to accept every repository — bypasses the allowlist.
      */
     private function __construct(
         public readonly string $appRoot,
@@ -58,6 +82,7 @@ final class Config
         public readonly string $githubHost,
         public readonly bool $allowForks,
         public readonly ?array $allowedRepos,
+        public readonly bool $allowAnyRepo,
         public readonly int $maxBodyBytes,
     ) {
     }
@@ -66,7 +91,6 @@ final class Config
     {
         $appRoot = rtrim($appRoot, '/\\');
         $stateDir = rtrim(self::env('SWITCHBOARD_STATE_DIR') ?? $appRoot . DIRECTORY_SEPARATOR . '.switchboard', '/\\');
-        $allowedRepos = self::env('SWITCHBOARD_ALLOWED_REPOS');
 
         return new self(
             appRoot: $appRoot,
@@ -74,7 +98,9 @@ final class Config
             webhookSecrets: self::secrets($stateDir . DIRECTORY_SEPARATOR . 'webhook_secret', 'SWITCHBOARD_WEBHOOK_SECRET'),
             githubHost: strtolower(self::env('SWITCHBOARD_GITHUB_HOST') ?? 'github.com'),
             allowForks: self::flag('SWITCHBOARD_ALLOW_FORKS', false),
-            allowedRepos: $allowedRepos === null ? null : self::splitList($allowedRepos),
+            allowedRepos: self::allowlist($stateDir . DIRECTORY_SEPARATOR . 'allowed_repos', 'SWITCHBOARD_ALLOWED_REPOS'),
+            allowAnyRepo: self::sentinel($stateDir . DIRECTORY_SEPARATOR . 'allow_any_repo')
+                || self::flag('SWITCHBOARD_ALLOW_ANY_REPO', false),
             maxBodyBytes: self::intEnv('SWITCHBOARD_MAX_BODY_BYTES', self::DEFAULT_MAX_BODY_BYTES),
         );
     }
@@ -96,15 +122,39 @@ final class Config
             githubHost: strtolower((string) ($values['githubHost'] ?? 'github.com')),
             allowForks: (bool) ($values['allowForks'] ?? false),
             allowedRepos: $values['allowedRepos'] ?? null,
+            allowAnyRepo: (bool) ($values['allowAnyRepo'] ?? false),
             maxBodyBytes: (int) ($values['maxBodyBytes'] ?? self::DEFAULT_MAX_BODY_BYTES),
         );
     }
 
-    /** Is `owner/repo` allowed to enqueue jobs? */
+    /**
+     * Is an allowlist (or an explicit allow-any opt-in) in force at all?
+     *
+     * `false` means the operator configured nothing — which {@see repoAllowed()}
+     * treats as "deny everything", not "allow everything". Surfaced on
+     * `/healthz` and named in the webhook rejection log so the misconfiguration
+     * is visible rather than silent.
+     */
+    public function allowlistConfigured(): bool
+    {
+        return $this->allowAnyRepo || ($this->allowedRepos !== null && $this->allowedRepos !== []);
+    }
+
+    /**
+     * Is `owner/repo` allowed to enqueue jobs?
+     *
+     * Fails **closed**: an unconfigured allowlist (`null` or empty) denies every
+     * repository. Only the explicit `allowAnyRepo` opt-in accepts everything —
+     * see the class docblock and issue #3.
+     */
     public function repoAllowed(string $fullName): bool
     {
-        if ($this->allowedRepos === null) {
+        if ($this->allowAnyRepo) {
             return true;
+        }
+
+        if ($this->allowedRepos === null || $this->allowedRepos === []) {
+            return false;
         }
 
         $fullName = strtolower($fullName);
@@ -136,6 +186,40 @@ final class Config
         $fromEnv = self::env($envName);
 
         return $fromEnv === null ? [] : [$fromEnv];
+    }
+
+    /**
+     * Read the repository allowlist from its file, falling back to an
+     * environment variable. Mirrors {@see secrets()} — the file is the source
+     * that actually reaches this code on ePHPm (nothing is injected into the
+     * vhost environment). `null` means "unconfigured", which the caller treats
+     * as fail-closed; a file present but holding only comments/blanks reads as
+     * unconfigured too, exactly like the secret file.
+     *
+     * @return list<string>|null
+     */
+    private static function allowlist(string $file, string $envName): ?array
+    {
+        $lines = SecretFile::read($file);
+        if ($lines !== []) {
+            return $lines;
+        }
+
+        $fromEnv = self::env($envName);
+
+        return $fromEnv === null ? null : self::splitList($fromEnv);
+    }
+
+    /**
+     * A sentinel file is "set" when it exists and carries at least one
+     * non-comment, non-blank line. Requiring content (rather than mere
+     * presence) keeps an accidental empty `touch` from silently opening the
+     * gate — the fail-closed direction. Any token works; `# why` comments are
+     * ignored, so leave a note about *who* opted in and keep a real line too.
+     */
+    private static function sentinel(string $file): bool
+    {
+        return SecretFile::read($file) !== [];
     }
 
     /** `$_SERVER` first — see the class docblock; ePHPm-injected values live there only. */
