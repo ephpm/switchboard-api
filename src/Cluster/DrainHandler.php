@@ -80,15 +80,25 @@ use Switchboard\Webhook\PreviewLabel;
  * `teardown@<sha>` marker rather than reaping it (switchboard's `teardown.rs`).
  * Those two halves are one contract; the daemon's half ships first.
  *
- * # A cursor that moves without work is reported
+ * # Reconcile on content, not on the generation cursor (switchboard#24)
  *
- * {@see handle()} warns when the generation advanced but this drain queued
- * nothing. That is the fingerprint of desired state withdrawn before this node
- * saw it, and it is what made the original incident invisible: nothing logged,
- * so the only evidence was a hand-diff of `applied/` across three nodes.
+ * {@see handle()} reconciles the desired-state **content** on every kick and
+ * never lets `switchboard:gen == last_gen` short-circuit that. `gen` is a
+ * single best-effort, gossip-replicated counter; a lost or lagged increment
+ * lets a preview key's content change — a deploy flipping to a teardown —
+ * while `gen` stays equal to a node's last-seen value. The old fast path
+ * trusted the cursor and returned without walking the index, so a node whose
+ * `gen` already matched never learned a teardown it had not received a webhook
+ * for, and kept serving a torn-down preview with every health check green.
+ * Walking every time is what closes that gap; the per-label `applied/<label>`
+ * marker keeps the walk idempotent and stops it re-materializing intents this
+ * node has already applied (which is why forcing a re-walk by resetting
+ * `last_gen` — resurrecting stale deploy intents — was the wrong fix).
  *
- * No network calls anywhere in this path. The common case — nothing changed
- * since `.switchboard/last_gen` — is two KV reads.
+ * The cursor is kept only for observability: when a walk queues work the
+ * generation number did not announce, {@see handle()} logs it as the signature
+ * of a lagged `gen`. No network calls anywhere in this path; a kick with
+ * nothing changed is one index read plus a marker comparison per label.
  */
 final class DrainHandler implements RequestHandlerInterface
 {
@@ -117,31 +127,45 @@ final class DrainHandler implements RequestHandlerInterface
             return $this->json->response(200, ['ok' => true, 'mode' => 'single-node', 'queued' => 0]);
         }
 
+        // Reconcile on the desired-state CONTENT every time — never trust the
+        // generation cursor to decide there is nothing to do (issue #4).
+        //
+        // `switchboard:gen` is one best-effort, gossip-replicated counter:
+        // ClusterState::publish() bumps it with an incr its own doc calls
+        // best-effort, and gossip can drop or lag that single increment while
+        // the preview-key `set` still replicates. When it does, a node's
+        // `last_gen` can already equal the published `gen` even though a preview
+        // key's content has since flipped deploy→teardown. The old
+        // `gen === last_gen` fast path returned right there, so `materialize()`
+        // never ran and the node never learned the preview should be gone —
+        // exactly how a torn-down preview kept being served on the cluster
+        // nodes that never received the close webhook, with every health check
+        // green (switchboard#24 closed the index-pruning race one layer up; this
+        // is the generation-vs-content race underneath it).
+        //
+        // Always walking is cheap and safe: the per-label `applied/<label>`
+        // marker makes an unchanged label a file read plus a string compare and
+        // re-queues nothing, so a re-kick with no real change stays idempotent.
+        // This is deliberately NOT "reset last_gen to force a re-walk" — that
+        // was rejected in the issue because it re-materializes stale deploy
+        // intents; the applied markers are what keep this walk from doing so.
         $gen = $this->cluster->generation();
         $lastGen = $this->readLastGen();
-        if ($gen === $lastGen) {
-            return $this->json->response(200, ['ok' => true, 'gen' => $gen, 'checked' => 0, 'queued' => 0]);
-        }
 
         [$checked, $queued] = $this->materialize($this->cluster);
 
-        // The cursor is about to move past generations this node did no work
-        // for. That is *usually* benign — but it is also the exact signature of
-        // desired state that was published and then withdrawn before this node
-        // drained, which is how a torn-down preview survives on one node of the
-        // cluster with every health check green (switchboard#24). It used to be
-        // completely silent; the incident it caused was found by diffing
-        // `applied/` markers across three nodes by hand. One line here would
-        // have named it in minutes, so it is a WARN even though it can fire
-        // benignly — a rare false positive is worth a failure mode that
-        // otherwise leaves no trace anywhere.
-        if ($queued === 0) {
-            Log::warn('drain: cursor advancing past generations this node did no work for', [
-                'from_gen' => $lastGen,
-                'to_gen' => $gen,
-                'skipped' => $gen - $lastGen,
+        // The cursor is advisory now: recorded for observability, never used to
+        // skip reconciliation. When content reconciliation queues work the
+        // generation number did NOT announce, that is the fingerprint of a
+        // gossip-lagged `switchboard:gen` — the very condition that used to
+        // strand a teardown. Naming it turns an invisible divergence into a log
+        // line.
+        if ($queued > 0 && $gen === $lastGen) {
+            Log::info('drain: reconciled desired-state content the generation cursor did not reflect', [
+                'gen' => $gen,
                 'checked' => $checked,
-                'hint' => 'desired state may have been withdrawn before this node drained',
+                'queued' => $queued,
+                'hint' => 'a lagged/lost switchboard:gen increment; content reconciliation caught it (switchboard#24)',
             ]);
         }
 
